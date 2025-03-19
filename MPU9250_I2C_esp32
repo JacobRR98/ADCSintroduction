@@ -1,0 +1,307 @@
+// Code for Platform IO - Arduino IDE
+// Baud Rate must be set to 115200
+#include <Arduino.h>
+#include <Wire.h>
+#include <EEPROM.h>
+
+// MPU9250 Configuration
+#define MPU9250_ADDR 0x68
+#define PWR_MGMT_1    0x6B
+#define ACCEL_XOUT_H  0x3B
+#define CONFIG        0x1A
+#define GYRO_CONFIG   0x1B
+#define ACCEL_CONFIG  0x1C
+#define WHO_AM_I      0x75
+
+// EEPROM Configuration
+#define EEPROM_SIZE 512
+#define EEPROM_START_ADDR 0
+#define EEPROM_MAGIC_NUMBER 0xAB
+#define EEPROM_VERSION 1
+
+// Calibration settings
+#define CALIB_SAMPLES 1000
+#define CALIB_DELAY   5
+#define FILTER_SAMPLES 8
+#define MAX_INIT_ATTEMPTS 3
+
+// Data structures
+struct CalibrationData {
+    float accel_offset[3] = {0, 0, 0};
+    float gyro_offset[3] = {0, 0, 0};
+    bool calibrated = false;
+    float temp_reference = 0.0;
+} calibration;
+
+// Global variables
+float filterBuffer[6][FILTER_SAMPLES] = {0};
+uint8_t filterIndex = 0;
+
+// Function prototypes
+void calibrateSensor();
+bool saveCalibration();
+bool loadCalibration();
+void handleSerialCommands();
+float applyFilter(float newValue, float* buffer);
+void readMPU9250Data();
+uint8_t calculateChecksum(uint8_t* data, size_t length);
+float readTemperature();
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    Serial.println("\nMPU9250 Visualization System");
+    Serial.println("Version 1.0.0");
+    
+    // Initialize MPU9250
+    Wire.beginTransmission(MPU9250_ADDR);
+    Wire.write(PWR_MGMT_1);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("Error initializing MPU9250");
+        while(1);
+    }
+    
+    // Initialize EEPROM
+    if (!EEPROM.begin(EEPROM_SIZE)) {
+        Serial.println("Failed to initialize EEPROM");
+        while(1);
+    }
+    
+    // Load or perform calibration
+    if (loadCalibration()) {
+        Serial.println("Loaded calibration from EEPROM");
+    } else {
+        Serial.println("Performing new calibration...");
+        calibrateSensor();
+    }
+    
+    delay(100);
+}
+
+void loop() {
+    static uint32_t lastUpdate = 0;
+    const uint32_t UPDATE_INTERVAL = 50; // 20Hz update rate
+    
+    handleSerialCommands();
+    
+    if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+        lastUpdate = millis();
+        readMPU9250Data();
+    }
+}
+
+void readMPU9250Data() {
+    Wire.beginTransmission(MPU9250_ADDR);
+    Wire.write(ACCEL_XOUT_H);
+    if (Wire.endTransmission(false) != 0) {
+        Serial.println("Error reading sensor");
+        return;
+    }
+    
+    Wire.requestFrom(MPU9250_ADDR, (uint8_t)14);
+    
+    int16_t raw_data[7];
+    for (int i = 0; i < 7; i++) {
+        raw_data[i] = (Wire.read() << 8) | Wire.read();
+    }
+    
+    float ax = raw_data[0] / 16384.0;
+    float ay = raw_data[1] / 16384.0;
+    float az = raw_data[2] / 16384.0;
+    float temperature = raw_data[3] / 340.0 + 36.53;
+    float gx = raw_data[4] / 131.0;
+    float gy = raw_data[5] / 131.0;
+    float gz = raw_data[6] / 131.0;
+    
+    // Apply calibration
+    if (calibration.calibrated) {
+        ax -= calibration.accel_offset[0];
+        ay -= calibration.accel_offset[1];
+        az -= calibration.accel_offset[2];
+        gx -= calibration.gyro_offset[0];
+        gy -= calibration.gyro_offset[1];
+        gz -= calibration.gyro_offset[2];
+    }
+    
+    // Apply filtering
+    ax = applyFilter(ax, filterBuffer[0]);
+    ay = applyFilter(ay, filterBuffer[1]);
+    az = applyFilter(az, filterBuffer[2]);
+    gx = applyFilter(gx, filterBuffer[3]);
+    gy = applyFilter(gy, filterBuffer[4]);
+    gz = applyFilter(gz, filterBuffer[5]);
+    
+    // Send formatted data for Processing
+    Serial.printf("DATA,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.2f\n",
+                 ax, ay, az, gx, gy, gz, temperature);
+    
+    filterIndex = (filterIndex + 1) % FILTER_SAMPLES;
+}
+
+void handleSerialCommands() {
+    if (Serial.available()) {
+        char cmd = Serial.read();
+        switch (cmd) {
+            case 'c':
+            case 'C':
+                calibrateSensor();
+                break;
+            case 'h':
+            case 'H':
+                Serial.println("\nCommands:");
+                Serial.println("c - Calibrate sensor");
+                Serial.println("h - Show this help");
+                break;
+        }
+        while(Serial.available()) Serial.read();
+    }
+}
+
+float applyFilter(float newValue, float* buffer) {
+    buffer[filterIndex] = newValue;
+    float sum = 0;
+    for(int i = 0; i < FILTER_SAMPLES; i++) {
+        sum += buffer[i];
+    }
+    return sum / FILTER_SAMPLES;
+}
+
+void calibrateSensor() {
+    Serial.println("\nStarting calibration...");
+    Serial.println("Keep sensor still and level!");
+    delay(2000);  // Give user time to prepare
+
+    float accel_sum[3] = {0, 0, 0};
+    float gyro_sum[3] = {0, 0, 0};
+    
+    // Collect samples
+    for(int i = 0; i < CALIB_SAMPLES; i++) {
+        Wire.beginTransmission(MPU9250_ADDR);
+        Wire.write(ACCEL_XOUT_H);
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU9250_ADDR, (uint8_t)14);
+
+        int16_t raw_data[7];
+        for(int j = 0; j < 7; j++) {
+            raw_data[j] = (Wire.read() << 8) | Wire.read();
+        }
+
+        // Accumulate accel data (remove gravity from z-axis)
+        accel_sum[0] += raw_data[0] / 16384.0;
+        accel_sum[1] += raw_data[1] / 16384.0;
+        accel_sum[2] += (raw_data[2] / 16384.0) - 1.0;  // Remove gravity
+
+        // Accumulate gyro data
+        gyro_sum[0] += raw_data[4] / 131.0;
+        gyro_sum[1] += raw_data[5] / 131.0;
+        gyro_sum[2] += raw_data[6] / 131.0;
+
+        if(i % 100 == 0) {
+            Serial.print("Calibrating... ");
+            Serial.print((i * 100) / CALIB_SAMPLES);
+            Serial.println("%");
+        }
+        delay(CALIB_DELAY);
+    }
+
+    // Calculate averages
+    for(int i = 0; i < 3; i++) {
+        calibration.accel_offset[i] = accel_sum[i] / CALIB_SAMPLES;
+        calibration.gyro_offset[i] = gyro_sum[i] / CALIB_SAMPLES;
+    }
+
+    calibration.calibrated = true;
+    calibration.temp_reference = readTemperature();
+
+    if (saveCalibration()) {
+        Serial.println("\nCalibration complete and saved!");
+    } else {
+        Serial.println("\nCalibration complete but save failed!");
+    }
+
+    // Print calibration values
+    Serial.println("Accelerometer offsets (g):");
+    Serial.printf("X: %.4f, Y: %.4f, Z: %.4f\n", 
+                 calibration.accel_offset[0],
+                 calibration.accel_offset[1],
+                 calibration.accel_offset[2]);
+    
+    Serial.println("Gyroscope offsets (°/s):");
+    Serial.printf("X: %.4f, Y: %.4f, Z: %.4f\n",
+                 calibration.gyro_offset[0],
+                 calibration.gyro_offset[1],
+                 calibration.gyro_offset[2]);
+}
+
+bool loadCalibration() {
+    // Check magic number
+    if (EEPROM.read(EEPROM_START_ADDR) != EEPROM_MAGIC_NUMBER) {
+        Serial.println("No valid calibration data found");
+        return false;
+    }
+    
+    // Check version
+    if (EEPROM.read(EEPROM_START_ADDR + 1) != EEPROM_VERSION) {
+        Serial.println("Calibration data version mismatch");
+        return false;
+    }
+    
+    uint8_t buffer[sizeof(CalibrationData) + 3];
+    
+    // Read from EEPROM
+    for (size_t i = 0; i < sizeof(buffer); i++) {
+        buffer[i] = EEPROM.read(EEPROM_START_ADDR + i);
+    }
+    
+    // Verify checksum
+    uint8_t stored_checksum = buffer[sizeof(buffer) - 1];
+    uint8_t calculated_checksum = calculateChecksum(buffer, sizeof(buffer) - 1);
+    
+    if (stored_checksum != calculated_checksum) {
+        Serial.println("Calibration data corrupted");
+        return false;
+    }
+    
+    // Copy calibration data
+    memcpy(&calibration, &buffer[2], sizeof(CalibrationData));
+    return true;
+}
+
+bool saveCalibration() {
+    uint8_t buffer[sizeof(CalibrationData) + 3];  // +3 for magic, version, checksum
+    buffer[0] = EEPROM_MAGIC_NUMBER;
+    buffer[1] = EEPROM_VERSION;
+    
+    // Copy calibration data to buffer
+    memcpy(&buffer[2], &calibration, sizeof(CalibrationData));
+    
+    // Calculate checksum
+    buffer[sizeof(buffer) - 1] = calculateChecksum(buffer, sizeof(buffer) - 1);
+    
+    // Write to EEPROM
+    for (size_t i = 0; i < sizeof(buffer); i++) {
+        EEPROM.write(EEPROM_START_ADDR + i, buffer[i]);
+    }
+    
+    return EEPROM.commit();
+}
+
+uint8_t calculateChecksum(uint8_t* data, size_t length) {
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < length; i++) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+
+float readTemperature() {
+    Wire.beginTransmission(MPU9250_ADDR);
+    Wire.write(0x41); // Temperature register
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU9250_ADDR, (uint8_t)2);
+    
+    int16_t temp = (Wire.read() << 8) | Wire.read();
+    return temp / 340.0 + 36.53;
+}
