@@ -1,0 +1,353 @@
+import processing.serial.*;
+
+// Constants
+final int SAMPLE_RATE_HZ = 100;
+final int BAUD_RATE = 115200;
+final String COM_PORT = "COM7";
+final int CONNECTION_TIMEOUT = 1000;
+final int MAX_RECONNECT_ATTEMPTS = 3;
+
+// Colors and visual settings
+final color BOARD_COLOR = color(200, 0, 0, 255);
+final color X_AXIS_COLOR = color(255, 0, 0);
+final color Y_AXIS_COLOR = color(0, 255, 0);
+final color Z_AXIS_COLOR = color(0, 0, 255);
+final color CONNECTED_COLOR = color(0, 255, 0);
+final color DISCONNECTED_COLOR = color(255, 0, 0);
+final color BUTTON_HOVER_COLOR = color(200, 200, 200);
+final color BUTTON_COLOR = color(150, 150, 150);
+
+// Button dimensions and positions
+final float BUTTON_WIDTH = 120;
+final float BUTTON_HEIGHT = 30;
+final float BUTTON_SPACING = 10;
+float buttonX;
+float buttonY;
+
+// Serial communication
+Serial myPort;
+String inData = "";
+boolean isConnected = false;
+int lastDataTime = 0;
+int reconnectAttempts = 0;
+boolean isReconnecting = false;
+
+// Quaternion data
+float w = 1, x = 0, y = 0, z = 0;
+
+// Visualization settings
+boolean showAxes = true;
+boolean showGrid = true;
+float scale = 1.0;
+float boardOpacity = 255;
+
+// Camera settings
+float defaultCameraDistance = 400;
+float defaultCameraAngleX = radians(30);
+float defaultCameraAngleY = radians(-45);
+float cameraDistance = defaultCameraDistance;
+float cameraAngleX = defaultCameraAngleX;
+float cameraAngleY = defaultCameraAngleY;
+boolean isDragging = false;
+float lastMouseX, lastMouseY;
+
+void setup() {
+    size(800, 600, P3D);
+    surface.setTitle("ICM20948 Quaternion Visualizer");
+    
+    buttonX = width - BUTTON_WIDTH - BUTTON_SPACING;
+    buttonY = height - (3 * BUTTON_HEIGHT + 2 * BUTTON_SPACING) - BUTTON_SPACING;
+    
+    textSize(14);
+    textFont(createFont("Courier New", 14));
+    
+    connectToPort();
+}
+
+void connectToPort() {
+    try {
+        myPort = new Serial(this, COM_PORT, BAUD_RATE);
+        myPort.bufferUntil('\n');
+        myPort.clear();
+        delay(1000);
+        isConnected = true;
+        lastDataTime = millis();
+        println("Connected successfully");
+    } catch (Exception e) {
+        println("Connection failed: " + e.getMessage());
+        isConnected = false;
+    }
+}
+
+void draw() {
+    checkConnection();
+    
+    background(50);
+    ambientLight(60, 60, 60);
+    directionalLight(255, 255, 255, -1, 1, -1);
+    
+    drawInfoPanel();
+    drawButtons();
+    
+    pushMatrix();
+    translate(width/2, height/2, 0);
+    translate(0, 0, -cameraDistance);
+    rotateX(cameraAngleX);
+    rotateY(cameraAngleY);
+    
+    if (showGrid) drawGrid();
+    
+    float m00 = 1 - 2 * (y*y + z*z);
+    float m01 = 2 * (x*y - z*w);
+    float m02 = 2 * (x*z + y*w);
+    float m10 = 2 * (x*y + z*w);
+    float m11 = 1 - 2 * (x*x + z*z);
+    float m12 = 2 * (y*z - x*w);
+    float m20 = 2 * (x*z - y*w);
+    float m21 = 2 * (y*z + x*w);
+    float m22 = 1 - 2 * (x*x + y*y);
+    
+    applyMatrix(m00, m01, m02, 0,
+                m10, m11, m12, 0,
+                m20, m21, m22, 0,
+                0,   0,   0,   1);
+    
+    drawBoard();
+    if (showAxes) drawAxes();
+    
+    popMatrix();
+}
+
+void checkConnection() {
+    if (millis() - lastDataTime > CONNECTION_TIMEOUT && !isReconnecting) {
+        isConnected = false;
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+            println("Connection lost. Attempting to reconnect...");
+            reconnect();
+            reconnectAttempts++;
+        }
+    }
+}
+
+void reconnect() {
+    isReconnecting = true;
+    try {
+        if (myPort != null) {
+            myPort.stop();
+        }
+        myPort = new Serial(this, COM_PORT, BAUD_RATE);
+        myPort.bufferUntil('\n');
+        myPort.clear();
+        delay(1000);
+        isConnected = true;
+        lastDataTime = millis();
+        println("Reconnection successful");
+    } catch (Exception e) {
+        println("Reconnection failed: " + e.getMessage());
+        isConnected = false;
+    }
+    isReconnecting = false;
+}
+
+void drawBoard() {
+    pushMatrix();
+    fill(BOARD_COLOR);
+    stroke(255);
+    strokeWeight(1.5);
+    box(150 * scale, 20 * scale, 100 * scale);
+    
+    // Direction indicator
+    fill(255);
+    translate(0, -10 * scale, 50 * scale);
+    rotateX(PI/2);
+    triangle(-10 * scale, 0, 10 * scale, 0, 0, 15 * scale);
+    popMatrix();
+}
+
+void drawButtons() {
+    textAlign(CENTER, CENTER);
+    
+    // Reset Camera button
+    if (isMouseOverButton(0)) {
+        fill(BUTTON_HOVER_COLOR);
+    } else {
+        fill(BUTTON_COLOR);
+    }
+    stroke(200);
+    rect(buttonX, buttonY, BUTTON_WIDTH, BUTTON_HEIGHT, 5);
+    fill(255);
+    text("Reset Camera", buttonX + BUTTON_WIDTH/2, buttonY + BUTTON_HEIGHT/2);
+
+    // Recalibrate button
+    if (isMouseOverButton(1)) {
+        fill(BUTTON_HOVER_COLOR);
+    } else {
+        fill(BUTTON_COLOR);
+    }
+    rect(buttonX, buttonY + BUTTON_HEIGHT + BUTTON_SPACING, BUTTON_WIDTH, BUTTON_HEIGHT, 5);
+    fill(255);
+    text("Recalibrate", buttonX + BUTTON_WIDTH/2, 
+         buttonY + BUTTON_HEIGHT + BUTTON_SPACING + BUTTON_HEIGHT/2);
+    
+    // Reconnect button (only shown when disconnected)
+    if (!isConnected) {
+        if (isMouseOverButton(2)) {
+            fill(BUTTON_HOVER_COLOR);
+        } else {
+            fill(BUTTON_COLOR);
+        }
+        rect(buttonX, buttonY + 2 * (BUTTON_HEIGHT + BUTTON_SPACING), 
+             BUTTON_WIDTH, BUTTON_HEIGHT, 5);
+        fill(255);
+        text("Reconnect", buttonX + BUTTON_WIDTH/2, 
+             buttonY + 2 * (BUTTON_HEIGHT + BUTTON_SPACING) + BUTTON_HEIGHT/2);
+    }
+    
+    textAlign(LEFT);
+}
+
+boolean isMouseOverButton(int buttonIndex) {
+    float buttonY = this.buttonY + buttonIndex * (BUTTON_HEIGHT + BUTTON_SPACING);
+    return mouseX >= buttonX && mouseX <= buttonX + BUTTON_WIDTH &&
+           mouseY >= buttonY && mouseY <= buttonY + BUTTON_HEIGHT;
+}
+
+void drawAxes() {
+    strokeWeight(2);
+    stroke(X_AXIS_COLOR); line(0, 0, 0, 100 * scale, 0, 0);
+    stroke(Y_AXIS_COLOR); line(0, 0, 0, 0, 100 * scale, 0);
+    stroke(Z_AXIS_COLOR); line(0, 0, 0, 0, 0, 100 * scale);
+}
+
+void drawGrid() {
+    stroke(100, 100, 100, 50);
+    strokeWeight(1);
+    float size = 200 * scale;
+    float step = 20 * scale;
+    for (float i = -size; i <= size; i += step) {
+        line(i, 0, -size, i, 0, size);
+        line(-size, 0, i, size, 0, i);
+    }
+}
+
+void drawInfoPanel() {
+    fill(255);
+    textAlign(LEFT);
+    
+    // Connection status
+    fill(isConnected ? CONNECTED_COLOR : DISCONNECTED_COLOR);
+    text("Connection: " + (isConnected ? "Connected" : "Disconnected"), 20, 30);
+    if (!isConnected) {
+        text("Reconnect attempts: " + reconnectAttempts + "/" + MAX_RECONNECT_ATTEMPTS, 20, 50);
+    }
+    
+    // Quaternion values
+    fill(255);
+    text("Quaternion:", 20, 80);
+    text("w: " + nf(w, 1, 3), 20, 100);
+    text("x: " + nf(x, 1, 3), 20, 120);
+    text("y: " + nf(y, 1, 3), 20, 140);
+    text("z: " + nf(z, 1, 3), 20, 160);
+    
+    // Controls
+    text("Controls:", 20, height - 140);
+    text("G: Toggle Grid", 20, height - 120);
+    text("A: Toggle Axes", 20, height - 100);
+    text("N: Reconnect", 20, height - 80);
+    text("Mouse Drag: Rotate View", 20, height - 60);
+    text("Scroll: Zoom", 20, height - 40);
+}
+
+void mousePressed() {
+    if (mouseX >= buttonX && mouseX <= buttonX + BUTTON_WIDTH) {
+        float buttonClickY = mouseY - buttonY;
+        int buttonIndex = int(buttonClickY / (BUTTON_HEIGHT + BUTTON_SPACING));
+        
+        if (buttonClickY >= 0 && buttonIndex >= 0 && buttonIndex <= 2) {
+            switch(buttonIndex) {
+                case 0: resetCamera(); return;
+                case 1: recalibrate(); return;
+                case 2: 
+                    if (!isConnected) {
+                        reconnectAttempts = 0;
+                        reconnect();
+                    }
+                    return;
+            }
+        }
+    }
+    
+    lastMouseX = mouseX;
+    lastMouseY = mouseY;
+    isDragging = true;
+}
+
+void mouseReleased() {
+    isDragging = false;
+}
+
+void mouseDragged() {
+    if (isDragging) {
+        float dx = mouseX - lastMouseX;
+        float dy = mouseY - lastMouseY;
+        cameraAngleY += dx * 0.01;
+        cameraAngleX += dy * 0.01;
+        lastMouseX = mouseX;
+        lastMouseY = mouseY;
+    }
+}
+
+void mouseWheel(MouseEvent event) {
+    float e = event.getCount();
+    cameraDistance += e * 50;
+    cameraDistance = constrain(cameraDistance, 200, 1000);
+}
+
+void keyPressed() {
+    switch(key) {
+        case 'g': case 'G': showGrid = !showGrid; break;
+        case 'a': case 'A': showAxes = !showAxes; break;
+        case 'r': case 'R': resetCamera(); break;
+        case 'c': case 'C': recalibrate(); break;
+        case 'n': case 'N': 
+            if (!isConnected) {
+                reconnectAttempts = 0;
+                reconnect();
+            }
+            break;
+    }
+}
+
+void resetCamera() {
+    cameraDistance = defaultCameraDistance;
+    cameraAngleX = defaultCameraAngleX;
+    cameraAngleY = defaultCameraAngleY;
+}
+
+void recalibrate() {
+    if (myPort != null && isConnected) {
+        myPort.write('c');
+        println("Sending calibration command");
+    }
+}
+
+void serialEvent(Serial p) {
+    inData = p.readStringUntil('\n');
+    if (inData != null) {
+        inData = trim(inData);
+        if (inData.startsWith("Q:")) {
+            String qdata = inData.substring(2);
+            String[] parts = split(qdata, ',');
+            if (parts.length >= 4) {
+                w = float(parts[0]);
+                x = float(parts[1]);
+                y = float(parts[2]);
+                z = float(parts[3]);
+                
+                isConnected = true;
+                lastDataTime = millis();
+                reconnectAttempts = 0;
+            }
+        }
+    }
+}
