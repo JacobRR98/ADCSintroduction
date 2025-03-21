@@ -1,0 +1,305 @@
+// set Baud rate to 115200
+#include <Arduino.h>
+#include <SPI.h>
+
+// Register definitions - Bank 0
+#define WHO_AM_I_REG 0x00
+#define USER_CTRL 0x03
+#define LP_CONFIG 0x05
+#define PWR_MGMT_1 0x06
+#define PWR_MGMT_2 0x07
+#define ACCEL_XOUT_H 0x2D
+#define GYRO_XOUT_H 0x33
+
+// Register definitions - Bank 2
+#define GYRO_SMPLRT_DIV 0x00
+#define GYRO_CONFIG_1 0x01
+#define GYRO_CONFIG_2 0x02
+#define ACCEL_CONFIG 0x14
+
+// Device and Configuration Values
+#define REG_BANK_SEL 0x7F
+#define READ_FLAG 0x80
+#define CS_PIN 5
+#define GYRO_RANGE_250DPS 0x00
+#define CALIB_SAMPLES 2000
+#define PROGRESS_INTERVAL 200
+#define STABILITY_THRESHOLD 5.0
+#define GYRO_SCALING 131.0
+#define ACCEL_SCALING 8192.0
+#define FILTER_SIZE 16
+#define RAD_TO_DEG 57.2957795131f
+#define DEG_TO_RAD 0.0174532925f
+#define SAMPLE_RATE_HZ 100
+
+// Global variables
+float accelOffset[3] = {0};
+float gyroOffset[3] = {0};
+float gyroXFilter[FILTER_SIZE] = {0};
+float gyroYFilter[FILTER_SIZE] = {0};
+float gyroZFilter[FILTER_SIZE] = {0};
+int filterIndex = 0;
+
+struct Quaternion {
+    float w, x, y, z;
+};
+
+Quaternion currentRotation = {1.0f, 0.0f, 0.0f, 0.0f};
+unsigned long lastUpdate = 0;
+
+// Basic SPI functions
+void writeRegister(uint8_t reg, uint8_t value) {
+    digitalWrite(CS_PIN, LOW);
+    SPI.transfer(reg & ~READ_FLAG);
+    SPI.transfer(value);
+    digitalWrite(CS_PIN, HIGH);
+}
+
+uint8_t readRegister(uint8_t reg) {
+    digitalWrite(CS_PIN, LOW);
+    SPI.transfer(reg | READ_FLAG);
+    uint8_t value = SPI.transfer(0x00);
+    digitalWrite(CS_PIN, HIGH);
+    return value;
+}
+
+void selectBank(uint8_t bank) {
+    writeRegister(REG_BANK_SEL, bank << 4);
+}
+
+// Device configuration functions
+void configureGyro() {
+    selectBank(2);
+    writeRegister(GYRO_CONFIG_1, GYRO_RANGE_250DPS);
+    writeRegister(GYRO_SMPLRT_DIV, 0x0A);
+    writeRegister(GYRO_CONFIG_2, 0x06);
+    
+    selectBank(0);
+    writeRegister(LP_CONFIG, 0x40);
+    delay(100);
+}
+
+float applyMovingAverage(float newValue, float* filterBuffer) {
+    filterBuffer[filterIndex] = newValue;
+    float sum = 0;
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += filterBuffer[i];
+    }
+    filterIndex = (filterIndex + 1) % FILTER_SIZE;
+    return sum / FILTER_SIZE;
+}
+
+void calibrateSensors() {
+    Serial.println("\nKeeping the sensor perfectly still for calibration...");
+    delay(1000);
+
+    // Zero the filter buffers
+    for(int i = 0; i < FILTER_SIZE; i++) {
+        gyroXFilter[i] = 0;
+        gyroYFilter[i] = 0;
+        gyroZFilter[i] = 0;
+    }
+    filterIndex = 0;
+
+    Serial.println("Calibrating sensors... Keep device still!");
+    Serial.println("This will take about " + String(CALIB_SAMPLES/1000) + " seconds");
+
+    float sumAccel[3] = {0}, sumGyro[3] = {0};
+    float sqSum[6] = {0};  // For variance calculation
+
+    for(int i = 0; i < CALIB_SAMPLES; i++) {
+        if(i % PROGRESS_INTERVAL == 0) {
+            Serial.printf("Progress: %d%%\n", (i * 100) / CALIB_SAMPLES);
+        }
+
+        digitalWrite(CS_PIN, LOW);
+        SPI.transfer(ACCEL_XOUT_H | READ_FLAG);
+        int16_t accelX = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        int16_t accelY = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        int16_t accelZ = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        digitalWrite(CS_PIN, HIGH);
+
+        digitalWrite(CS_PIN, LOW);
+        SPI.transfer(GYRO_XOUT_H | READ_FLAG);
+        int16_t gyroX = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        int16_t gyroY = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        int16_t gyroZ = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+        digitalWrite(CS_PIN, HIGH);
+
+        float ax = accelX / ACCEL_SCALING;
+        float ay = accelY / ACCEL_SCALING;
+        float az = (accelZ / ACCEL_SCALING) - 1.0;
+        float gx = gyroX / GYRO_SCALING;
+        float gy = gyroY / GYRO_SCALING;
+        float gz = gyroZ / GYRO_SCALING;
+
+        sumAccel[0] += ax; sqSum[0] += ax * ax;
+        sumAccel[1] += ay; sqSum[1] += ay * ay;
+        sumAccel[2] += az; sqSum[2] += az * az;
+        sumGyro[0] += gx; sqSum[3] += gx * gx;
+        sumGyro[1] += gy; sqSum[4] += gy * gy;
+        sumGyro[2] += gz; sqSum[5] += gz * gz;
+
+        delay(2);
+    }
+
+    for(int i = 0; i < 3; i++) {
+        accelOffset[i] = sumAccel[i] / CALIB_SAMPLES;
+        gyroOffset[i] = sumGyro[i] / CALIB_SAMPLES;
+    }
+
+    Serial.println("\nCalibration complete!");
+    Serial.printf("Accel offsets: X=%.3f Y=%.3f Z=%.3f\n", 
+                 accelOffset[0], accelOffset[1], accelOffset[2]);
+    Serial.printf("Gyro offsets: X=%.3f Y=%.3f Z=%.3f\n", 
+                 gyroOffset[0], gyroOffset[1], gyroOffset[2]);
+}
+
+void normalizeQuaternion(Quaternion& q) {
+    float norm = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (norm != 0) {
+        q.w /= norm;
+        q.x /= norm;
+        q.y /= norm;
+        q.z /= norm;
+    }
+}
+
+Quaternion hamiltonProduct(const Quaternion& q1, const Quaternion& q2) {
+    Quaternion result;
+    result.w = q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z;
+    result.x = q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y;
+    result.y = q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x;
+    result.z = q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w;
+    return result;
+}
+
+void updateQuaternion(float ax, float ay, float az, float gx, float gy, float gz, float dt) {
+    // Convert gyro rates to radians/sec
+    gx *= DEG_TO_RAD;
+    gy *= DEG_TO_RAD;
+    gz *= DEG_TO_RAD;
+    
+    // Normalize accelerometer vector
+    float accelNorm = sqrt(ax * ax + ay * ay + az * az);
+    if (accelNorm != 0.0f) {
+        ax /= accelNorm;
+        ay /= accelNorm;
+        az /= accelNorm;
+    }
+    
+    // Create accelerometer-based quaternion (roll and pitch only)
+    float roll = atan2(ay, az);
+    float pitch = atan2(-ax, sqrt(ay * ay + az * az));
+    
+    Quaternion accelQuat;
+    accelQuat.w = cos(roll/2) * cos(pitch/2);
+    accelQuat.x = cos(roll/2) * sin(pitch/2);
+    accelQuat.y = sin(roll/2) * cos(pitch/2);
+    accelQuat.z = -sin(roll/2) * sin(pitch/2);
+    
+    // Create rotation quaternion from gyro data
+    float halfDt = dt * 0.5f;
+    Quaternion gyroRotation;
+    float halfGx = gx * halfDt;
+    float halfGy = gy * halfDt;
+    float halfGz = gz * halfDt;
+    
+    gyroRotation.w = cos(halfGx) * cos(halfGy) * cos(halfGz) + sin(halfGx) * sin(halfGy) * sin(halfGz);
+    gyroRotation.x = sin(halfGx) * cos(halfGy) * cos(halfGz) - cos(halfGx) * sin(halfGy) * sin(halfGz);
+    gyroRotation.y = cos(halfGx) * sin(halfGy) * cos(halfGz) + sin(halfGx) * cos(halfGy) * sin(halfGz);
+    gyroRotation.z = cos(halfGx) * cos(halfGy) * sin(halfGz) - sin(halfGx) * sin(halfGy) * cos(halfGz);
+    
+    // Apply gyro rotation
+    currentRotation = hamiltonProduct(currentRotation, gyroRotation);
+    normalizeQuaternion(currentRotation);
+    
+    // Complementary filter between gyro and accelerometer
+    const float ALPHA = 0.96f;  // Adjust this value to change filter strength
+    currentRotation.w = ALPHA * currentRotation.w + (1.0f - ALPHA) * accelQuat.w;
+    currentRotation.x = ALPHA * currentRotation.x + (1.0f - ALPHA) * accelQuat.x;
+    currentRotation.y = ALPHA * currentRotation.y + (1.0f - ALPHA) * accelQuat.y;
+    currentRotation.z = ALPHA * currentRotation.z + (1.0f - ALPHA) * accelQuat.z;
+    
+    normalizeQuaternion(currentRotation);
+}
+
+void setup() {
+    Serial.begin(115200);
+    while(!Serial) delay(10);
+    Serial.println("ICM-20948 SPI Test");
+
+    pinMode(CS_PIN, OUTPUT);
+    digitalWrite(CS_PIN, HIGH);
+    SPI.begin(18, 19, 23);
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+
+    selectBank(0);
+    writeRegister(PWR_MGMT_1, 0x80);  // Reset device
+    delay(100);
+    writeRegister(PWR_MGMT_1, 0x01);  // Auto select best clock source
+    writeRegister(PWR_MGMT_2, 0x00);  // Enable all sensors
+    delay(100);
+
+    uint8_t whoAmI = readRegister(WHO_AM_I_REG);
+    Serial.printf("WHO_AM_I = 0x%02X\n", whoAmI);
+    if(whoAmI != 0xEA) {
+        Serial.println("ICM-20948 not found. Check your connections!");
+        while(1);
+    }
+    Serial.println("ICM-20948 found!");
+
+    configureGyro();
+    delay(100);
+
+    calibrateSensors();
+}
+
+void loop() {
+    unsigned long now = micros();
+    float dt = (now - lastUpdate) / 1000000.0f;
+    lastUpdate = now;
+    
+    digitalWrite(CS_PIN, LOW);
+    SPI.transfer(ACCEL_XOUT_H | READ_FLAG);
+    int16_t accelX = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    int16_t accelY = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    int16_t accelZ = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    digitalWrite(CS_PIN, HIGH);
+
+    digitalWrite(CS_PIN, LOW);
+    SPI.transfer(GYRO_XOUT_H | READ_FLAG);
+    int16_t gyroX = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    int16_t gyroY = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    int16_t gyroZ = (SPI.transfer(0x00) << 8) | SPI.transfer(0x00);
+    digitalWrite(CS_PIN, HIGH);
+
+    float ax = (accelX / ACCEL_SCALING) - accelOffset[0];
+    float ay = (accelY / ACCEL_SCALING) - accelOffset[1];
+    float az = (accelZ / ACCEL_SCALING) - accelOffset[2];
+
+    float gx = (gyroX / GYRO_SCALING) - gyroOffset[0];
+    float gy = (gyroY / GYRO_SCALING) - gyroOffset[1];
+    float gz = (gyroZ / GYRO_SCALING) - gyroOffset[2];
+
+    gx = applyMovingAverage(gx, gyroXFilter);
+    gy = applyMovingAverage(gy, gyroYFilter);
+    gz = applyMovingAverage(gz, gyroZFilter);
+
+    updateQuaternion(ax, ay, az, gx, gy, gz, dt);
+
+    // Send quaternion data over serial
+    Serial.printf("Q: %.3f,%.3f,%.3f,%.3f\n", 
+                 currentRotation.w, currentRotation.x, 
+                 currentRotation.y, currentRotation.z);
+
+    if(Serial.available() > 0) {
+        char cmd = Serial.read();
+        if(cmd == 'c' || cmd == 'C') {
+            calibrateSensors();
+            currentRotation = {1.0f, 0.0f, 0.0f, 0.0f}; // Reset quaternion after calibration
+        }
+    }
+
+    delay(1000/SAMPLE_RATE_HZ);  // 100Hz update rate
+}
